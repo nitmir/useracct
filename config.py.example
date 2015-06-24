@@ -1,0 +1,22 @@
+import MySQLdb
+#import psycopg2
+
+sql_module = MySQLdb
+sql_credentials = {
+  "user": "accounting",
+  "passwd": "password",
+  "db":"accounting",
+  "host":"localhost",
+  "charset":'utf8',
+}
+
+#sql_module = psycopg2
+#sql_credentials = {
+#  "user": "accounting",
+#  "password": "password",
+#  "database":"accounting",
+#  "host":"localhost",
+#}
+
+DUMP_INTERVAL = 15 * 60
+QUEUE_NUMBER = 1

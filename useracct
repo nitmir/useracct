@@ -1,0 +1,135 @@
+#!/usr/bin/env python
+import os
+import sys
+import pwd
+import grp
+import time
+import nflog
+import socket
+import threading
+import collections
+
+import config
+
+def drop_privileges(uid_name='nobody', gid_name='nogroup'):
+    if os.getuid() != 0:
+        # We're not root so, like, whatever dude
+        return
+
+    # Get the uid/gid from the name
+    running_uid = pwd.getpwnam(uid_name).pw_uid
+    running_gid = grp.getgrnam(gid_name).gr_gid
+
+    # Remove group privileges
+    os.setgroups([])
+
+    # Try setting the new uid/gid
+    os.setgid(running_gid)
+    os.setuid(running_uid)
+
+    # Ensure a very conservative umask
+    os.umask(077)
+
+
+class UserAcct(object):
+
+    def __init__(self, DUMP_INTERVAL, QUEUE_NUMBER, db_module, db_credentials):
+        self.stop = False
+        self.BUFFER = collections.defaultdict(lambda: [0, 0])
+        self.lock = threading.Lock()
+        self.DUMP_INTERVAL = DUMP_INTERVAL
+        self.db_module = db_module
+        self.db_credentials = db_credentials
+        self.QUEUE_NUMBER = QUEUE_NUMBER
+
+    def run(self):
+        l = nflog.log()
+        l.set_callback(self.callback)
+
+        l.open()
+        l.create_queue(self.QUEUE_NUMBER)
+        l.bind(socket.AF_INET)
+        l.bind(socket.AF_INET6)
+
+        t = self.dump_loop()
+        self.drop_privileges()
+        try:
+            l.try_run()
+        except KeyboardInterrupt:
+            print "interrupted"
+        self.stop = True
+        self.dump()
+
+        l.unbind(socket.AF_INET)
+        l.unbind(socket.AF_INET6)
+        l.close()
+
+        for i in range(0, 60):
+            if not t.is_alive():
+                break
+            else:
+                time.sleep(1)
+        else:
+            print "dump thread killed"
+
+    def drop_privileges(self):
+        t2 = threading.Thread(target=self._drop_privileges)
+        t2.daemon = True
+        t2.start()
+
+    def _drop_privileges(self):
+        time.sleep(1)
+        drop_privileges()
+
+    def callback(self, payload):
+        user = payload.get_uid()
+        if user > 0:
+            out = (payload.get_outdev() > 0)
+            with self.lock:
+                self.BUFFER[user][out] += payload.get_length()
+
+    def dump_loop(self):
+        t = threading.Thread(target=self._dump_loop)
+        t.daemon = True
+        t.start()
+        return t
+
+    def _dump_loop(self):
+        while True:
+            for i in xrange(self.DUMP_INTERVAL):
+                time.sleep(1)
+                if self.stop:
+                    return
+            self.dump()
+
+    def dump(self):
+        query = "INSERT INTO accounting (user, input, output) VALUES "
+        values = []
+        args = []
+        with self.lock:
+            for user, (input, output) in self.BUFFER.items():
+                values.append("(%s, %s, %s)")
+                args.append(user)
+                args.append(input)
+                args.append(output)
+            if not args:
+                return True
+            query += ", ".join(values)
+            args = tuple(args)
+            try:
+                db = self.db_module.connect(**self.db_credentials)
+                cur = db.cursor()
+                cur.execute(query, args)
+                db.commit()
+                cur.close()
+                db.close()
+                self.BUFFER = collections.defaultdict(lambda: [0, 0])
+                return True
+            except self.db_module.Error as e:
+                sys.stderr.write("SQL Error: %s\n" % e)
+                return False
+
+
+if __name__ == '__main__':
+    useracct = UserAcct(config.DUMP_INTERVAL, config.QUEUE_NUMBER, config.sql_module, config.sql_credentials)
+    useracct.run()
