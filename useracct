@@ -5,11 +5,36 @@ import pwd
 import grp
 import time
 import nflog
+import signal
 import socket
 import threading
 import collections
+from multiprocessing import Process, Value
+from contextlib import closing, contextmanager
 
 import config
+
+
+@contextmanager
+def run_nflog(callback, QUEUE_NUMBER):
+    l = nflog.log()
+    l.set_callback(callback)
+
+    l.open()
+    try:
+        l.create_queue(QUEUE_NUMBER)
+        l.unbind(socket.AF_INET)
+        l.unbind(socket.AF_INET6)
+        l.bind(socket.AF_INET)
+        l.bind(socket.AF_INET6)
+        try:
+            yield l
+        finally:
+            l.unbind(socket.AF_INET)
+            l.unbind(socket.AF_INET6)
+    finally:
+        l.close()
+
 
 def drop_privileges(uid_name='nobody', gid_name='nogroup'):
     if os.getuid() != 0:
@@ -31,99 +56,137 @@ def drop_privileges(uid_name='nobody', gid_name='nogroup'):
     os.umask(077)
 
 
+def _term(sig, fra):
+    os.kill(os.getpid(), signal.SIGINT)
+
+
+def _sigint(sig, fra):
+    pass
+
+
 class UserAcct(object):
 
-    def __init__(self, DUMP_INTERVAL, QUEUE_NUMBER, db_module, db_credentials):
-        self.stop = False
-        self.BUFFER = collections.defaultdict(lambda: [0, 0])
+    def __init__(
+            self,
+            DUMP_INTERVAL,
+            QUEUE_NUMBER,
+            db_module, db_credentials,
+            user,
+            group
+    ):
+        self.stop = Value('i', 0)
         self.lock = threading.Lock()
         self.DUMP_INTERVAL = DUMP_INTERVAL
         self.db_module = db_module
         self.db_credentials = db_credentials
         self.QUEUE_NUMBER = QUEUE_NUMBER
 
+        self.BUFFER = collections.defaultdict(lambda: [0, 0])
+
+        self.privileges_dropped = False
+        self.user = user
+        self.group = group
+
     def run(self):
-        l = nflog.log()
-        l.set_callback(self.callback)
-
-        l.open()
-        l.create_queue(self.QUEUE_NUMBER)
-        l.bind(socket.AF_INET)
-        l.bind(socket.AF_INET6)
-
-        t = self.dump_loop()
-        self.drop_privileges()
+        p = Process(target=self._run)
         try:
-            l.try_run()
+            signal.signal(signal.SIGTERM, _term)
+            last_spawn = time.time()
+            p.start()
+            p.join()
+            while self.stop.value == 0:
+                if time.time() - last_spawn < 1:
+                    time.sleep(1)
+                p = Process(target=self._run)
+                last_spawn = time.time()
+                p.start()
+                p.join()
         except KeyboardInterrupt:
-            print "interrupted"
-        self.stop = True
-        self.dump()
+            signal.signal(signal.SIGINT, _sigint)
+            self.stop.value = 1
+            if p.pid:
+                os.kill(p.pid, signal.SIGINT)
+            p.join()
 
-        l.unbind(socket.AF_INET)
-        l.unbind(socket.AF_INET6)
-        l.close()
+    def _run(self):
+        with run_nflog(self.callback, self.QUEUE_NUMBER) as l:
+            with self.dump_loop():
+                try:
+                    signal.signal(signal.SIGTERM, _term)
+                    l.try_run()
+                except KeyboardInterrupt:
+                    signal.signal(signal.SIGINT, _sigint)
+                    print "interrupted"
+                    self.stop.value = 1
+                except RuntimeError as error:
+                    print "RuntimeError: %s" % error
 
-        for i in range(0, 60):
-            if not t.is_alive():
-                break
-            else:
-                time.sleep(1)
-        else:
-            print "dump thread killed"
-
-    def drop_privileges(self):
-        t2 = threading.Thread(target=self._drop_privileges)
-        t2.daemon = True
-        t2.start()
-
-    def _drop_privileges(self):
-        time.sleep(1)
-        drop_privileges()
+    def force_dump(self):
+        while not self.dump():
+            time.sleep(0.1)
 
     def callback(self, payload):
+        if not self.privileges_dropped:
+            drop_privileges(self.user, self.group)
         user = payload.get_uid()
         if user > 0:
             out = (payload.get_outdev() > 0)
             with self.lock:
                 self.BUFFER[user][out] += payload.get_length()
 
+    @contextmanager
     def dump_loop(self):
-        t = threading.Thread(target=self._dump_loop)
+        stop_lock = threading.Lock()
+        stop_cond = threading.Condition()
+        t = threading.Thread(target=self._dump_loop, args=(stop_cond, stop_lock))
         t.daemon = True
-        t.start()
-        return t
+        try:
+            with stop_lock:
+                t.start()
+                yield t
+        finally:
+            with stop_cond:
+                stop_cond.notify()
+            for i in xrange(0, 500):
+                if not t.is_alive():
+                    break
+                else:
+                    time.sleep(0.01)
+            else:
+                print "fail to stop dump thread after 5s"
 
-    def _dump_loop(self):
-        while True:
-            for i in xrange(self.DUMP_INTERVAL):
-                time.sleep(1)
-                if self.stop:
+    def _dump_loop(self, stop_cond, stop_lock):
+        with stop_cond:
+            while True:
+                stop_cond.wait(self.DUMP_INTERVAL)
+                if stop_lock.acquire(False):
+                    print "exit dump loop"
+                    self.force_dump()
                     return
-            self.dump()
+                else:
+                    self.dump()
 
     def dump(self):
         query = "INSERT INTO accounting (user, input, output) VALUES "
         values = []
         args = []
         with self.lock:
+            if not self.BUFFER:
+                print "nothing to dump"
+                return True
             for user, (input, output) in self.BUFFER.items():
                 values.append("(%s, %s, %s)")
                 args.append(user)
                 args.append(input)
                 args.append(output)
-            if not args:
-                return True
             query += ", ".join(values)
             args = tuple(args)
             try:
-                db = self.db_module.connect(**self.db_credentials)
-                cur = db.cursor()
-                cur.execute(query, args)
-                db.commit()
-                cur.close()
-                db.close()
-                self.BUFFER = collections.defaultdict(lambda: [0, 0])
+                with closing(self.db_module.connect(**self.db_credentials)) as db:
+                    with closing(db.cursor()) as cur:
+                        cur.execute(query, args)
+                        db.commit()
+                self.BUFFER.clear()
                 return True
             except self.db_module.Error as e:
                 sys.stderr.write("SQL Error: %s\n" % e)
@@ -131,5 +194,18 @@ class UserAcct(object):
 
 
 if __name__ == '__main__':
-    useracct = UserAcct(config.DUMP_INTERVAL, config.QUEUE_NUMBER, config.sql_module, config.sql_credentials)
+    try:
+        import prctl
+        prctl.set_name("useracct")
+        prctl.set_proctitle(" ".join(sys.argv))
+    except ImportError:
+        print "install python-prctl if you want"
+    useracct = UserAcct(
+        config.DUMP_INTERVAL,
+        config.QUEUE_NUMBER,
+        config.sql_module,
+        config.sql_credentials,
+        config.USER,
+        config.GROUP,
+    )
     useracct.run()

@@ -20,3 +20,7 @@ sql_credentials = {
 
 DUMP_INTERVAL = 15 * 60
 QUEUE_NUMBER = 1
+
+USER="nobody"
+GROUP="nogroup"
+
