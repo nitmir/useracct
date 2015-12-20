@@ -18,4 +18,4 @@ ip6tables -A OUTPUT -j NFLOG --nflog-group 1
 ## Notes ##
 
 You need a version of python-nflog that return user uid like
-https://github.com/nitmir/nflog-bindings
+https://github.com/chifflier/nflog-bindings
