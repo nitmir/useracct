@@ -111,9 +111,10 @@ class UserAcct(object):
     def _run(self):
         with run_nflog(self.callback, self.QUEUE_NUMBER) as l:
             with self.dump_loop():
+                l.prepare()
                 try:
                     signal.signal(signal.SIGTERM, _term)
-                    l.try_run()
+                    l.loop()
                 except KeyboardInterrupt:
                     signal.signal(signal.SIGINT, _sigint)
                     print "interrupted"
